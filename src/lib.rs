@@ -98,13 +98,6 @@ impl<T: Internable> PooledArc<T> {
         &self.0
     }
 
-    /// Convert into the inner `Arc<T>`, disconnected from the pool.
-    pub fn into_arc(self) -> Arc<T> {
-        Arc::clone(&self.0)
-        // self is dropped here, which may clean up the pool entry
-        // if no other PooledArc references this value
-    }
-
     /// Number of strong references to this value
     /// (includes the pool's own reference).
     pub fn strong_count(&self) -> usize {
@@ -114,6 +107,12 @@ impl<T: Internable> PooledArc<T> {
     /// Get a raw pointer to the inner value for fast identity checks.
     pub fn as_ptr(&self) -> *const T {
         Arc::as_ptr(&self.0)
+    }
+}
+
+impl<T: Internable> From<T> for PooledArc<T> {
+    fn from(value: T) -> Self {
+        Self::new(value)
     }
 }
 
