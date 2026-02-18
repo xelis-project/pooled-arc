@@ -372,4 +372,93 @@ mod tests {
         let b = Foo { id: 900, name: "test".to_string() };
         assert!(a == b);
     }
+
+    /// A type where `Hash` always produces the same value,
+    /// but `Eq` compares by actual content. This forces every
+    /// insert into the same hash bucket, exercising the collision path.
+    #[derive(Eq, PartialEq, Clone, Debug)]
+    struct Collider {
+        value: u64,
+    }
+
+    impl Hash for Collider {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            // Constant hash: every Collider lands in the same bucket
+            0u64.hash(state);
+        }
+    }
+
+    impl_internable!(Collider);
+
+    #[test]
+    fn test_hash_collision_different_values() {
+        let a = PooledArc::new(Collider { value: 1 });
+        let b = PooledArc::new(Collider { value: 2 });
+
+        // Same hash, but different values must NOT share an Arc
+        assert!(!Arc::ptr_eq(a.inner(), b.inner()));
+        assert_ne!(a, b);
+
+        // Each should still deduplicate with its own equal value
+        let a2 = PooledArc::new(Collider { value: 1 });
+        let b2 = PooledArc::new(Collider { value: 2 });
+        assert!(Arc::ptr_eq(a.inner(), a2.inner()));
+        assert!(Arc::ptr_eq(b.inner(), b2.inner()));
+        assert!(a == a2);
+        assert!(b == b2);
+    }
+
+    #[test]
+    fn test_hash_collision_cleanup() {
+        let c1 = PooledArc::new(Collider { value: 10 });
+        let c2 = PooledArc::new(Collider { value: 20 });
+        let c3 = PooledArc::new(Collider { value: 30 });
+
+        let hash = compute_hash(&Collider { value: 10 });
+        // All three share the same bucket
+        {
+            let map = Collider::pool().lock().unwrap();
+            assert_eq!(map.get(&hash).unwrap().len(), 3);
+        }
+
+        // Drop one — only its entry should be removed from the bucket
+        drop(c2);
+        {
+            let map = Collider::pool().lock().unwrap();
+            let entries = map.get(&hash).unwrap();
+            assert_eq!(entries.len(), 2);
+            // c1 and c3 must still be alive
+            let alive: Vec<_> = entries.iter().filter_map(|w| w.upgrade()).collect();
+            assert_eq!(alive.len(), 2);
+        }
+
+        // Drop the rest — bucket should be fully removed
+        drop(c1);
+        drop(c3);
+        {
+            let map = Collider::pool().lock().unwrap();
+            assert!(!map.contains_key(&hash));
+        }
+    }
+
+    #[test]
+    fn test_hash_collision_many_values() {
+        // Insert many distinct values that all collide
+        let arcs: Vec<_> = (0..100)
+            .map(|i| PooledArc::new(Collider { value: i }))
+            .collect();
+
+        // All should be distinct allocations
+        for i in 0..arcs.len() {
+            for j in (i + 1)..arcs.len() {
+                assert!(!Arc::ptr_eq(arcs[i].inner(), arcs[j].inner()));
+            }
+        }
+
+        // Deduplication still works within the collision bucket
+        for i in 0..100u64 {
+            let dup = PooledArc::new(Collider { value: i });
+            assert!(Arc::ptr_eq(arcs[i as usize].inner(), dup.inner()));
+        }
+    }
 }
