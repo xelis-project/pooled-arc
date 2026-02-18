@@ -1,0 +1,18 @@
+[package]
+name = "pooled-arc"
+version = "0.1.0"
+edition = "2024"
+authors = ["Slixe <slixeprivate@gmail.com>"]
+description = "A library providing a thread-safe, memory-efficient way to manage shared objects in Rust."
+license = "MIT"
+keywords = ["intern", "pool", "arc"]
+
+repository = "https://github.com/xelis-project/pooled-arc"
+homepage = "https://github.com/xelis-project/pooled-arc"
+readme = "README.md"
+
+[features]
+serde = ["dep:serde"]
+
+[dependencies]
+serde = { version = "1.0", optional = true }
