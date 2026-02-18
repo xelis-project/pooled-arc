@@ -1,6 +1,4 @@
-# Pooled Arc
-
-## Overview
+## Pooled Arc
 
 The `pooled-arc` library provides a thread-safe, memory-efficient way to manage shared objects in Rust using a combination of `Arc` and `Weak` references.
 
