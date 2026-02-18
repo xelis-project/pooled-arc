@@ -34,7 +34,10 @@ macro_rules! impl_internable {
             impl $crate::Internable for $ty {
                 #[inline(always)]
                 fn pool() -> &'static $crate::SharedPool<Self> {
-                    use std::sync::LazyLock;
+                    use std::{
+                        collections::HashMap,
+                        sync::{LazyLock, Mutex}
+                    };
                     static POOL: LazyLock<$crate::SharedPool<$ty>> = LazyLock::new(|| Mutex::new(HashMap::new()));
                     &POOL
                 }
