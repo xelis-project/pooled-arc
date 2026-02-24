@@ -2,19 +2,30 @@ use std::{
     borrow::Borrow,
     collections::HashMap,
     fmt::{self, Debug, Display},
-    hash::{DefaultHasher, Hash, Hasher},
+    hash::{Hash, Hasher},
     ops::Deref,
     sync::{Arc, Mutex, Weak},
 };
 
-pub type SharedPool<T> = Mutex<HashMap<u64, Vec<Weak<T>>>>;
+/// Wrapper for raw pointers to make them thread-safe when T is Send + Sync.
+///
+/// # Safety
+///
+/// This is safe because:
+/// 1. We only store pointers derived from `Arc::as_ptr()` on live Arc allocations
+/// 2. Each Arc has a unique pointer that never changes during its lifetime
+/// 3. Pointers are only used as HashMap keys for identity-based lookup, never dereferenced
+/// 4. The pool's Weak<T> references prevent use-after-free (we verify via strong_count())
+/// 5. Pointers are removed from the pool before the Arc is freed (via Drop)
+///
+/// The pointer is never used to access data directly; it only enables O(1) removal.
+#[derive(PartialEq, Eq, Hash)]
+pub struct PoolPtr<T: ?Sized>(*const T);
 
-/// Compute a u64 hash of a value for pool bucketing.
-fn compute_hash<T: Hash>(value: &T) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    value.hash(&mut hasher);
-    hasher.finish()
-}
+unsafe impl<T: ?Sized + Send + Sync> Send for PoolPtr<T> {}
+unsafe impl<T: ?Sized + Send + Sync> Sync for PoolPtr<T> {}
+
+pub type SharedPool<T> = Mutex<HashMap<PoolPtr<T>, Weak<T>>>;
 
 /// Trait for types that can be interned in a global static pool.
 ///
@@ -57,20 +68,15 @@ pub struct PooledArc<T: Internable>(Arc<T>);
 
 impl<T: Internable> PooledArc<T> {
     /// Helper to find an existing `Arc<T>` in the pool that matches the given value.
-    fn find_matching_arc(value: &T, entries: &mut Vec<Weak<T>>) -> Option<Arc<T>> {
-        let mut found = None;
-        entries.retain(|w| {
-            if let Some(arc) = w.upgrade() {
+    fn find_matching_arc(value: &T, map: &HashMap<PoolPtr<T>, Weak<T>>) -> Option<Arc<T>> {
+        for weak in map.values() {
+            if let Some(arc) = weak.upgrade() {
                 if *arc == *value {
-                    found = Some(arc);
+                    return Some(arc);
                 }
-                true
-            } else {
-                false // dead weak, remove it
             }
-        });
-
-        found
+        }
+        None
     }
 
     /// Create or retrieve an interned `PooledArc` for the given value.
@@ -78,18 +84,16 @@ impl<T: Internable> PooledArc<T> {
     /// If an equal value already exists in the pool, the existing
     /// `Arc<T>` is reused. Otherwise, a new one is created and stored.
     pub fn new(value: T) -> Self {
-        let hash = compute_hash(&value);
         let pool = T::pool();
         let mut map = pool.lock().expect("Failed to lock pool");
 
-        if let Some(entries) = map.get_mut(&hash) {
-            if let Some(arc) = Self::find_matching_arc(&value, entries) {
-                return Self(arc);
-            }
+        if let Some(arc) = Self::find_matching_arc(&value, &map) {
+            return Self(arc);
         }
 
         let arc = Arc::new(value);
-        map.entry(hash).or_default().push(Arc::downgrade(&arc));
+        let ptr = PoolPtr(Arc::as_ptr(&arc));
+        map.insert(ptr, Arc::downgrade(&arc));
         Self(arc)
     }
 
@@ -118,18 +122,16 @@ impl<T: Internable> From<T> for PooledArc<T> {
 
 impl<T: Internable + Clone> PooledArc<T> {
     pub fn from_ref(value: &T) -> Self {
-        let hash = compute_hash(&value);
         let pool = T::pool();
         let mut map = pool.lock().expect("Failed to lock pool");
 
-        if let Some(entries) = map.get_mut(&hash) {
-            if let Some(arc) = Self::find_matching_arc(value, entries) {
-                return Self(arc);
-            }
+        if let Some(arc) = Self::find_matching_arc(value, &map) {
+            return Self(arc);
         }
 
         let arc = Arc::new(value.clone());
-        map.entry(hash).or_default().push(Arc::downgrade(&arc));
+        let ptr = PoolPtr(Arc::as_ptr(&arc));
+        map.insert(ptr, Arc::downgrade(&arc));
         Self(arc)
     }
 
@@ -144,21 +146,9 @@ impl<T: Internable> Drop for PooledArc<T> {
         // strong_count == 1 means only this PooledArc holds it;
         // after this drop the Arc will be freed, so clean up the pool.
         if Arc::strong_count(&self.0) <= 1 {
-            let hash = compute_hash(self.0.as_ref());
+            let ptr = PoolPtr(Arc::as_ptr(&self.0));
             if let Ok(mut map) = T::pool().lock() {
-                if let Some(entries) = map.get_mut(&hash) {
-                    // Remove our specific weak (same allocation) and any dead ones
-                    let self_ptr = Arc::as_ptr(&self.0);
-                    entries.retain(|w| {
-                        match w.upgrade() {
-                            Some(arc) => !std::ptr::eq(Arc::as_ptr(&arc), self_ptr),
-                            None => false, // dead weak, remove it
-                        }
-                    });
-                    if entries.is_empty() {
-                        map.remove(&hash);
-                    }
-                }
+                map.remove(&ptr);
             }
         }
     }
@@ -298,9 +288,8 @@ mod tests {
         drop(a);
         // After dropping the only user reference, pool entry is removed
         let map = Foo::pool().lock().unwrap();
-        let hash = compute_hash(&val);
         assert!(
-            !map.contains_key(&hash),
+            map.is_empty(),
             "Pool entry should be cleaned up after last PooledArc is dropped"
         );
     }
@@ -414,30 +403,28 @@ mod tests {
         let c2 = PooledArc::new(Collider { value: 20 });
         let c3 = PooledArc::new(Collider { value: 30 });
 
-        let hash = compute_hash(&Collider { value: 10 });
-        // All three share the same bucket
+        // All three are in the pool
         {
             let map = Collider::pool().lock().unwrap();
-            assert_eq!(map.get(&hash).unwrap().len(), 3);
+            assert_eq!(map.len(), 3);
         }
 
-        // Drop one — only its entry should be removed from the bucket
+        // Drop one — only its entry should be removed from the pool
         drop(c2);
         {
             let map = Collider::pool().lock().unwrap();
-            let entries = map.get(&hash).unwrap();
-            assert_eq!(entries.len(), 2);
+            assert_eq!(map.len(), 2);
             // c1 and c3 must still be alive
-            let alive: Vec<_> = entries.iter().filter_map(|w| w.upgrade()).collect();
+            let alive: Vec<_> = map.values().filter_map(|w| w.upgrade()).collect();
             assert_eq!(alive.len(), 2);
         }
 
-        // Drop the rest — bucket should be fully removed
+        // Drop the rest — pool should be fully empty
         drop(c1);
         drop(c3);
         {
             let map = Collider::pool().lock().unwrap();
-            assert!(!map.contains_key(&hash));
+            assert!(map.is_empty());
         }
     }
 
